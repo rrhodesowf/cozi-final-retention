@@ -1,0 +1,145 @@
+%sql
+WITH sp AS (
+  SELECT year, sharepoint_new_users
+  FROM sharepoint_new_users
+  WHERE source = 'ANDROID'
+),
+
+op_base AS (
+  SELECT
+    account_id,
+    subscription_id,
+    CAST(original_sub_begin_date AS DATE) AS original_sub_begin_date,
+    CAST(sub_begin_month        AS DATE) AS sub_begin_month
+  FROM op
+  WHERE UPPER(conversion_platform) = 'ANDROID'
+    AND currency_code = 'USD'
+    AND sub_status IN ('active','canceled')
+    AND periodicity IN ('month','year')
+    AND account_id IS NOT NULL
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_begin_month IS NOT NULL
+    -- reduce scan: only activity in the SharePoint years
+    AND YEAR(sub_begin_month) IN (SELECT year FROM sp)
+),
+
+op_subs AS (
+  SELECT DISTINCT subscription_id
+  FROM op_base
+),
+
+events AS (
+  SELECT
+    se.subscription_id,
+    CAST(COALESCE(se.raw_subscription_timestamp, se.raw_event_timestamp) AS TIMESTAMP) AS evt_ts,
+    CAST(
+      COALESCE(
+        se.raw_subscription:paymentState,
+        CAST(get_json_object(CAST(se.raw_subscription AS STRING), '$.paymentState') AS INT)
+      ) AS INT
+    ) AS payment_state
+  FROM unity_catalog.cozi_payments.subscription_events se
+  INNER JOIN op_subs s
+    ON se.subscription_id = s.subscription_id
+  WHERE se.subscription_id IS NOT NULL
+),
+
+events_ranked AS (
+  SELECT
+    subscription_id,
+    evt_ts,
+    payment_state,
+    ROW_NUMBER() OVER (PARTITION BY subscription_id ORDER BY evt_ts) AS rn
+  FROM events
+  WHERE evt_ts IS NOT NULL
+    AND payment_state IS NOT NULL
+),
+
+sub_payment_flags AS (
+  SELECT
+    subscription_id,
+    MAX(CASE WHEN rn = 1 THEN payment_state END) AS first_payment_state,
+    MIN(CASE WHEN payment_state = 1 THEN evt_ts END) AS first_paid_ts
+  FROM events_ranked
+  GROUP BY 1
+),
+
+op_enriched AS (
+  SELECT
+    o.*,
+    f.first_payment_state,
+    f.first_paid_ts,
+    CASE WHEN f.first_payment_state = 2 THEN 1 ELSE 0 END AS is_trial_start,
+    CASE WHEN f.first_payment_state = 2 AND f.first_paid_ts IS NULL THEN 1 ELSE 0 END AS is_trial_only,
+    CASE
+      WHEN f.first_payment_state = 2 THEN CAST(f.first_paid_ts AS DATE)
+      ELSE o.original_sub_begin_date
+    END AS paid_cohort_date
+  FROM op_base o
+  LEFT JOIN sub_payment_flags f
+    ON o.subscription_id = f.subscription_id
+),
+
+paid_adjusted_rows AS (
+  SELECT *
+  FROM op_enriched
+  WHERE is_trial_only = 0
+    AND (
+      is_trial_start = 0
+      OR (
+        paid_cohort_date IS NOT NULL
+        AND sub_begin_month >= TRUNC(paid_cohort_date, 'month')
+      )
+    )
+),
+
+counts AS (
+  -- OLD (Tableau-style): diagonal by original_sub_begin_date year
+  SELECT
+    'tableau_current' AS logic,
+    YEAR(original_sub_begin_date) AS year,
+    COUNT(DISTINCT account_id) AS platform_new_users
+  FROM op_base
+  WHERE YEAR(sub_begin_month) = YEAR(original_sub_begin_date)          -- diagonal
+    AND YEAR(original_sub_begin_date) IN (SELECT year FROM sp)
+  GROUP BY 1,2
+
+  UNION ALL
+
+  -- NEW (paid-adjusted): diagonal by paid_cohort_date year
+  SELECT
+    'updated_logic' AS logic,
+    YEAR(paid_cohort_date) AS year,
+    COUNT(DISTINCT account_id) AS platform_new_users
+  FROM paid_adjusted_rows
+  WHERE paid_cohort_date IS NOT NULL
+    AND YEAR(sub_begin_month) = YEAR(paid_cohort_date)                -- diagonal
+    AND YEAR(paid_cohort_date) IN (SELECT year FROM sp)
+  GROUP BY 1,2
+),
+
+pivoted AS (
+  SELECT
+    year,
+    MAX(CASE WHEN logic = 'tableau_current' THEN platform_new_users END) AS platform_tableau_current,
+    MAX(CASE WHEN logic = 'updated_logic'   THEN platform_new_users END) AS platform_updated_logic
+  FROM counts
+  GROUP BY 1
+)
+
+SELECT
+  'ANDROID' AS source,
+  sp.year,
+  sp.sharepoint_new_users,
+  COALESCE(p.platform_tableau_current, 0) AS platform_tableau_current,
+  COALESCE(p.platform_updated_logic,   0) AS platform_updated_logic,
+  COALESCE(p.platform_tableau_current, 0) - sp.sharepoint_new_users AS delta_tableau_minus_sharepoint,
+  COALESCE(p.platform_updated_logic,   0) - sp.sharepoint_new_users AS delta_updated_minus_sharepoint,
+  COALESCE(p.platform_updated_logic, 0) - COALESCE(p.platform_tableau_current, 0) AS delta_updated_minus_tableau,
+  ROUND((COALESCE(p.platform_tableau_current,0) / NULLIF(sp.sharepoint_new_users,0) - 1) * 100, 2) AS pct_delta_tableau,
+  ROUND((COALESCE(p.platform_updated_logic,0)   / NULLIF(sp.sharepoint_new_users,0) - 1) * 100, 2) AS pct_delta_updated
+FROM sp
+LEFT JOIN pivoted p
+  ON sp.year = p.year
+ORDER BY sp.year;
