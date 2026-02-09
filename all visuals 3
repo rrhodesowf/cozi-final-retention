@@ -1,0 +1,336 @@
+# %python
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------
+# ALL-SOURCES (IOS + ANDROID + STRIPE) aggregated visuals
+# 6 outputs in THIS order:
+# 1. tableau_current user count (table)
+# 2. tableau_current retention rate (table)
+# 3. tableau_current retention rate heatmap
+# 4. updated_logic user count (table)
+# 5. updated_logic retention rate (table)
+# 6. updated_logic retention rate heatmap
+#
+# Formatting matches your IOS setup (blank below diagonal, same heatmap config).
+# NOTE: "ALL" is an aggregation by summing platform-level counts (no cross-source de-dupe).
+# ------------------------------------------------------------
+
+# Optional year range override (leave None to auto-derive from returned data)
+MIN_YEAR = None
+MAX_YEAR = None
+
+sql = """
+WITH
+/* =========================
+   IOS (Apple provider)
+   ========================= */
+ios_base AS (
+  SELECT
+    account_id,
+    subscription_id,
+    sub_iteration,
+    CAST(original_sub_begin_date AS DATE) AS original_sub_begin_date,
+    CAST(sub_begin_month        AS DATE) AS sub_begin_month
+  FROM op
+  WHERE UPPER(conversion_platform) = 'IOS'
+    AND currency_code = 'USD'
+    AND sub_status IN ('active','canceled')
+    AND periodicity IN ('month','year')
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_begin_month IS NOT NULL
+    AND provider_name IS NOT NULL
+    AND LOWER(provider_name) LIKE '%apple%'
+),
+ios_with_first AS (
+  SELECT
+    b.*,
+    MIN(CASE WHEN b.sub_iteration = 1 THEN b.original_sub_begin_date END)
+      OVER (PARTITION BY b.account_id) AS first_start_date
+  FROM ios_base b
+),
+
+/* =========================
+   STRIPE (WEB + Stripe provider)
+   ========================= */
+stripe_base AS (
+  SELECT
+    account_id,
+    subscription_id,
+    sub_iteration,
+    CAST(original_sub_begin_date AS DATE) AS original_sub_begin_date,
+    CAST(sub_begin_month        AS DATE) AS sub_begin_month
+  FROM op
+  WHERE UPPER(conversion_platform) = 'WEB'
+    AND sub_status IN ('active','canceled')
+    AND periodicity IN ('month','year')
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_begin_month IS NOT NULL
+    AND provider_name IS NOT NULL
+    AND LOWER(provider_name) LIKE '%stripe%'
+),
+stripe_with_first AS (
+  SELECT
+    b.*,
+    MIN(CASE WHEN b.sub_iteration = 1 THEN b.original_sub_begin_date END)
+      OVER (PARTITION BY b.account_id) AS first_start_date
+  FROM stripe_base b
+),
+
+/* =========================
+   ANDROID (trial -> paid adjusted)
+   ========================= */
+android_base AS (
+  SELECT
+    account_id,
+    subscription_id,
+    CAST(original_sub_begin_date AS DATE) AS original_sub_begin_date,
+    CAST(sub_begin_month        AS DATE) AS sub_begin_month
+  FROM op
+  WHERE UPPER(conversion_platform) = 'ANDROID'
+    AND currency_code = 'USD'
+    AND sub_status IN ('active','canceled')
+    AND periodicity IN ('month','year')
+    AND account_id IS NOT NULL
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_begin_month IS NOT NULL
+),
+android_subs AS (
+  SELECT DISTINCT subscription_id
+  FROM android_base
+),
+android_events AS (
+  SELECT
+    se.subscription_id,
+    CAST(COALESCE(se.raw_subscription_timestamp, se.raw_event_timestamp) AS TIMESTAMP) AS evt_ts,
+    CAST(
+      COALESCE(
+        se.raw_subscription:paymentState,
+        CAST(get_json_object(CAST(se.raw_subscription AS STRING), '$.paymentState') AS INT)
+      ) AS INT
+    ) AS payment_state
+  FROM unity_catalog.cozi_payments.subscription_events se
+  INNER JOIN android_subs s
+    ON se.subscription_id = s.subscription_id
+  WHERE se.subscription_id IS NOT NULL
+),
+android_events_ranked AS (
+  SELECT
+    subscription_id,
+    evt_ts,
+    payment_state,
+    ROW_NUMBER() OVER (PARTITION BY subscription_id ORDER BY evt_ts) AS rn
+  FROM android_events
+  WHERE evt_ts IS NOT NULL
+    AND payment_state IS NOT NULL
+),
+android_flags AS (
+  SELECT
+    subscription_id,
+    MAX(CASE WHEN rn = 1 THEN payment_state END) AS first_payment_state,
+    MIN(CASE WHEN payment_state = 1 THEN evt_ts END) AS first_paid_ts
+  FROM android_events_ranked
+  GROUP BY 1
+),
+android_enriched AS (
+  SELECT
+    o.*,
+    f.first_payment_state,
+    f.first_paid_ts,
+    CASE WHEN f.first_payment_state = 2 THEN 1 ELSE 0 END AS is_trial_start,
+    CASE WHEN f.first_payment_state = 2 AND f.first_paid_ts IS NULL THEN 1 ELSE 0 END AS is_trial_only,
+    CASE
+      WHEN f.first_payment_state = 2 THEN CAST(f.first_paid_ts AS DATE)
+      ELSE o.original_sub_begin_date
+    END AS paid_cohort_date
+  FROM android_base o
+  LEFT JOIN android_flags f
+    ON o.subscription_id = f.subscription_id
+),
+android_paid_adjusted AS (
+  SELECT *
+  FROM android_enriched
+  WHERE is_trial_only = 0
+    AND (
+      is_trial_start = 0
+      OR (
+        paid_cohort_date IS NOT NULL
+        AND sub_begin_month >= TRUNC(paid_cohort_date, 'month')
+      )
+    )
+),
+
+/* =========================
+   PLATFORM-LEVEL COUNTS (distinct per platform)
+   ========================= */
+platform_counts AS (
+  -- IOS
+  SELECT
+    'tableau_current' AS cohort_def,
+    YEAR(original_sub_begin_date) AS cohort_year,
+    YEAR(sub_begin_month)         AS activity_year,
+    COUNT(DISTINCT account_id)    AS user_cnt
+  FROM ios_with_first
+  GROUP BY 1,2,3
+
+  UNION ALL
+
+  SELECT
+    'updated_logic' AS cohort_def,
+    YEAR(first_start_date) AS cohort_year,
+    YEAR(sub_begin_month)  AS activity_year,
+    COUNT(DISTINCT account_id) AS user_cnt
+  FROM ios_with_first
+  WHERE first_start_date IS NOT NULL
+  GROUP BY 1,2,3
+
+  -- STRIPE
+  UNION ALL
+
+  SELECT
+    'tableau_current' AS cohort_def,
+    YEAR(original_sub_begin_date) AS cohort_year,
+    YEAR(sub_begin_month)         AS activity_year,
+    COUNT(DISTINCT account_id)    AS user_cnt
+  FROM stripe_with_first
+  GROUP BY 1,2,3
+
+  UNION ALL
+
+  SELECT
+    'updated_logic' AS cohort_def,
+    YEAR(first_start_date) AS cohort_year,
+    YEAR(sub_begin_month)  AS activity_year,
+    COUNT(DISTINCT account_id) AS user_cnt
+  FROM stripe_with_first
+  WHERE first_start_date IS NOT NULL
+  GROUP BY 1,2,3
+
+  -- ANDROID
+  UNION ALL
+
+  SELECT
+    'tableau_current' AS cohort_def,
+    YEAR(original_sub_begin_date) AS cohort_year,
+    YEAR(sub_begin_month)         AS activity_year,
+    COUNT(DISTINCT account_id)    AS user_cnt
+  FROM android_base
+  GROUP BY 1,2,3
+
+  UNION ALL
+
+  SELECT
+    'updated_logic' AS cohort_def,
+    YEAR(paid_cohort_date) AS cohort_year,
+    YEAR(sub_begin_month)  AS activity_year,
+    COUNT(DISTINCT account_id) AS user_cnt
+  FROM android_paid_adjusted
+  WHERE paid_cohort_date IS NOT NULL
+  GROUP BY 1,2,3
+),
+
+/* =========================
+   ALL-SOURCES rollup (sum platform-level counts)
+   ========================= */
+all_counts AS (
+  SELECT
+    cohort_def,
+    cohort_year,
+    activity_year,
+    SUM(user_cnt) AS user_cnt
+  FROM platform_counts
+  WHERE cohort_year IS NOT NULL AND activity_year IS NOT NULL
+  GROUP BY 1,2,3
+)
+SELECT * FROM all_counts
+"""
+
+df = spark.sql(sql).toPandas()
+
+if df.empty:
+    print("No data returned. Check op view creation / provider filters.")
+else:
+    df["cohort_year"] = df["cohort_year"].astype(int)
+    df["activity_year"] = df["activity_year"].astype(int)
+    df["user_cnt"] = pd.to_numeric(df["user_cnt"], errors="coerce").fillna(0).astype(int)
+
+    # IOS-style auto year range (shared axis => aligned output)
+    if MIN_YEAR is None:
+        MIN_YEAR = int(min(df["cohort_year"].min(), df["activity_year"].min()))
+    if MAX_YEAR is None:
+        MAX_YEAR = int(max(df["cohort_year"].max(), df["activity_year"].max()))
+    years = list(range(MIN_YEAR, MAX_YEAR + 1))
+
+    def build_matrix(df_sub: pd.DataFrame) -> pd.DataFrame:
+        mat = (
+            df_sub.pivot_table(
+                index="cohort_year",
+                columns="activity_year",
+                values="user_cnt",
+                aggfunc="sum",
+                fill_value=0
+            )
+            .reindex(index=years, columns=years, fill_value=0)
+            .astype(float)
+        )
+        # blank below diagonal to match Tableau / your IOS look
+        r = np.array(mat.index)
+        c = np.array(mat.columns)
+        return mat.where(c[None, :] >= r[:, None], np.nan)
+
+    def retention_from_matrix(mat: pd.DataFrame) -> pd.DataFrame:
+        diag = pd.Series({y: (mat.at[y, y] if (y in mat.index and y in mat.columns) else np.nan) for y in mat.index})
+        diag = diag.replace({0: np.nan})
+        return mat.div(diag, axis=0)
+
+    def display_matrix_as_table(mat: pd.DataFrame, title: str, is_percent: bool = False):
+        if is_percent:
+            tbl = (mat * 100.0).copy()
+            tbl = tbl.applymap(lambda x: "" if pd.isna(x) else f"{x:,.2f}%")
+        else:
+            tbl = mat.copy()
+            tbl = tbl.applymap(lambda x: "" if pd.isna(x) else f"{int(x):,}")
+        print(title)
+        try:
+            display(tbl)
+        except NameError:
+            print(tbl)
+
+    def plot_heatmap(mat: pd.DataFrame, title: str, vmin=None, vmax=None):
+        data = np.ma.masked_invalid(mat.values)
+        fig, ax = plt.subplots(figsize=(14, 6))
+        im = ax.imshow(data, aspect="auto", interpolation="nearest", vmin=vmin, vmax=vmax)
+        ax.set_title(title)
+        ax.set_xticks(np.arange(len(mat.columns)))
+        ax.set_xticklabels(mat.columns, rotation=90)
+        ax.set_yticks(np.arange(len(mat.index)))
+        ax.set_yticklabels(mat.index)
+        plt.colorbar(im, ax=ax)
+        plt.tight_layout()
+        plt.show()
+
+    # ------------------------------------------------------------
+    # EXACT 6 outputs in the requested order
+    # ------------------------------------------------------------
+
+    # 1-3) tableau_current
+    df_t = df[df["cohort_def"] == "tableau_current"].copy()
+    user_mat_t = build_matrix(df_t)
+    ret_mat_t  = retention_from_matrix(user_mat_t)
+
+    display_matrix_as_table(user_mat_t, "ALL (IOS+ANDROID+STRIPE) | tableau_current | User Count")
+    display_matrix_as_table(ret_mat_t,  "ALL (IOS+ANDROID+STRIPE) | tableau_current | Retention Rate", is_percent=True)
+    plot_heatmap(ret_mat_t,            "ALL (IOS+ANDROID+STRIPE) | tableau_current | Retention Rate Heatmap", vmin=0, vmax=1)
+
+    # 4-6) updated_logic
+    df_u = df[df["cohort_def"] == "updated_logic"].copy()
+    user_mat_u = build_matrix(df_u)
+    ret_mat_u  = retention_from_matrix(user_mat_u)
+
+    display_matrix_as_table(user_mat_u, "ALL (IOS+ANDROID+STRIPE) | updated_logic | User Count")
+    display_matrix_as_table(ret_mat_u,  "ALL (IOS+ANDROID+STRIPE) | updated_logic | Retention Rate", is_percent=True)
+    plot_heatmap(ret_mat_u,            "ALL (IOS+ANDROID+STRIPE) | updated_logic | Retention Rate Heatmap", vmin=0, vmax=1)
