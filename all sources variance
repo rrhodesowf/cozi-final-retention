@@ -1,0 +1,298 @@
+%sql
+-- ============================================================
+-- ALL SOURCES (IOS + ANDROID + STRIPE) variance vs SharePoint
+-- Years: 2024, 2025
+-- Uses ONLY: op + sharepoint_new_users
+-- ============================================================
+
+WITH yrs AS (
+  SELECT DISTINCT year
+  FROM sharepoint_new_users
+  WHERE year IN (2024, 2025)
+),
+
+sp_total AS (
+  SELECT
+    year,
+    SUM(sharepoint_new_users) AS sharepoint_new_users_total
+  FROM sharepoint_new_users
+  WHERE year IN (2024, 2025)
+  GROUP BY year
+),
+
+/* =========================
+   IOS (Apple provider)
+   ========================= */
+ios_first AS (
+  SELECT
+    account_id,
+    MIN(CAST(original_sub_begin_date AS DATE)) AS first_start_date
+  FROM op
+  WHERE UPPER(conversion_platform) = 'IOS'
+    AND currency_code = 'USD'
+    AND sub_status IN ('active','canceled')
+    AND periodicity IN ('month','year')
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_iteration = 1
+    AND provider_name IS NOT NULL
+    AND LOWER(provider_name) LIKE '%apple%'
+  GROUP BY 1
+),
+
+ios_base_years AS (
+  SELECT
+    account_id,
+    CAST(original_sub_begin_date AS DATE) AS original_sub_begin_date,
+    CAST(sub_begin_month        AS DATE) AS sub_begin_month
+  FROM op
+  WHERE UPPER(conversion_platform) = 'IOS'
+    AND currency_code = 'USD'
+    AND sub_status IN ('active','canceled')
+    AND periodicity IN ('month','year')
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_begin_month IS NOT NULL
+    AND provider_name IS NOT NULL
+    AND LOWER(provider_name) LIKE '%apple%'
+    AND YEAR(sub_begin_month) IN (SELECT year FROM yrs)
+),
+
+ios_counts AS (
+  -- OLD (Tableau-style diagonal)
+  SELECT
+    'tableau_current' AS logic,
+    YEAR(original_sub_begin_date) AS year,
+    COUNT(DISTINCT account_id) AS platform_new_users
+  FROM ios_base_years
+  WHERE YEAR(sub_begin_month) = YEAR(original_sub_begin_date)
+  GROUP BY 1,2
+
+  UNION ALL
+
+  -- NEW (Apple-aligned diagonal)
+  SELECT
+    'updated_logic' AS logic,
+    YEAR(f.first_start_date) AS year,
+    COUNT(DISTINCT a.account_id) AS platform_new_users
+  FROM ios_base_years a
+  JOIN ios_first f
+    ON a.account_id = f.account_id
+  WHERE f.first_start_date IS NOT NULL
+    AND YEAR(a.sub_begin_month) = YEAR(f.first_start_date)
+  GROUP BY 1,2
+),
+
+/* =========================
+   STRIPE (WEB + Stripe provider)
+   ========================= */
+stripe_first AS (
+  SELECT
+    account_id,
+    MIN(CAST(original_sub_begin_date AS DATE)) AS first_start_date
+  FROM op
+  WHERE UPPER(conversion_platform) = 'WEB'
+    AND sub_status IN ('active','canceled')
+    AND periodicity IN ('month','year')
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_iteration = 1
+    AND provider_name IS NOT NULL
+    AND LOWER(provider_name) LIKE '%stripe%'
+  GROUP BY 1
+),
+
+stripe_base_years AS (
+  SELECT
+    account_id,
+    CAST(original_sub_begin_date AS DATE) AS original_sub_begin_date,
+    CAST(sub_begin_month        AS DATE) AS sub_begin_month
+  FROM op
+  WHERE UPPER(conversion_platform) = 'WEB'
+    AND sub_status IN ('active','canceled')
+    AND periodicity IN ('month','year')
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_begin_month IS NOT NULL
+    AND provider_name IS NOT NULL
+    AND LOWER(provider_name) LIKE '%stripe%'
+    AND YEAR(sub_begin_month) IN (SELECT year FROM yrs)
+),
+
+stripe_counts AS (
+  -- OLD (Tableau-style diagonal)
+  SELECT
+    'tableau_current' AS logic,
+    YEAR(original_sub_begin_date) AS year,
+    COUNT(DISTINCT account_id) AS platform_new_users
+  FROM stripe_base_years
+  WHERE YEAR(sub_begin_month) = YEAR(original_sub_begin_date)
+  GROUP BY 1,2
+
+  UNION ALL
+
+  -- NEW (Stripe-aligned diagonal)
+  SELECT
+    'updated_logic' AS logic,
+    YEAR(f.first_start_date) AS year,
+    COUNT(DISTINCT a.account_id) AS platform_new_users
+  FROM stripe_base_years a
+  JOIN stripe_first f
+    ON a.account_id = f.account_id
+  WHERE f.first_start_date IS NOT NULL
+    AND YEAR(a.sub_begin_month) = YEAR(f.first_start_date)
+  GROUP BY 1,2
+),
+
+/* =========================
+   ANDROID (trial -> paid adjusted)
+   ========================= */
+android_base_years AS (
+  SELECT
+    account_id,
+    subscription_id,
+    CAST(original_sub_begin_date AS DATE) AS original_sub_begin_date,
+    CAST(sub_begin_month        AS DATE) AS sub_begin_month
+  FROM op
+  WHERE UPPER(conversion_platform) = 'ANDROID'
+    AND currency_code = 'USD'
+    AND sub_status IN ('active','canceled')
+    AND periodicity IN ('month','year')
+    AND account_id IS NOT NULL
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_begin_month IS NOT NULL
+    AND YEAR(sub_begin_month) IN (SELECT year FROM yrs)
+),
+
+android_subs AS (
+  SELECT DISTINCT subscription_id
+  FROM android_base_years
+),
+
+android_events AS (
+  SELECT
+    se.subscription_id,
+    CAST(COALESCE(se.raw_subscription_timestamp, se.raw_event_timestamp) AS TIMESTAMP) AS evt_ts,
+    CAST(
+      COALESCE(
+        se.raw_subscription:paymentState,
+        CAST(get_json_object(CAST(se.raw_subscription AS STRING), '$.paymentState') AS INT)
+      ) AS INT
+    ) AS payment_state
+  FROM unity_catalog.cozi_payments.subscription_events se
+  INNER JOIN android_subs s
+    ON se.subscription_id = s.subscription_id
+  WHERE se.subscription_id IS NOT NULL
+),
+
+android_events_ranked AS (
+  SELECT
+    subscription_id,
+    evt_ts,
+    payment_state,
+    ROW_NUMBER() OVER (PARTITION BY subscription_id ORDER BY evt_ts) AS rn
+  FROM android_events
+  WHERE evt_ts IS NOT NULL
+    AND payment_state IS NOT NULL
+),
+
+android_flags AS (
+  SELECT
+    subscription_id,
+    MAX(CASE WHEN rn = 1 THEN payment_state END) AS first_payment_state,
+    MIN(CASE WHEN payment_state = 1 THEN evt_ts END) AS first_paid_ts
+  FROM android_events_ranked
+  GROUP BY 1
+),
+
+android_enriched AS (
+  SELECT
+    o.*,
+    f.first_payment_state,
+    f.first_paid_ts,
+    CASE WHEN f.first_payment_state = 2 THEN 1 ELSE 0 END AS is_trial_start,
+    CASE WHEN f.first_payment_state = 2 AND f.first_paid_ts IS NULL THEN 1 ELSE 0 END AS is_trial_only,
+    CASE
+      WHEN f.first_payment_state = 2 THEN CAST(f.first_paid_ts AS DATE)
+      ELSE o.original_sub_begin_date
+    END AS paid_cohort_date
+  FROM android_base_years o
+  LEFT JOIN android_flags f
+    ON o.subscription_id = f.subscription_id
+),
+
+android_paid_adjusted AS (
+  SELECT *
+  FROM android_enriched
+  WHERE is_trial_only = 0
+    AND (
+      is_trial_start = 0
+      OR (
+        paid_cohort_date IS NOT NULL
+        AND sub_begin_month >= TRUNC(paid_cohort_date, 'month')
+      )
+    )
+),
+
+android_counts AS (
+  -- OLD (Tableau-style diagonal)
+  SELECT
+    'tableau_current' AS logic,
+    YEAR(original_sub_begin_date) AS year,
+    COUNT(DISTINCT account_id) AS platform_new_users
+  FROM android_base_years
+  WHERE YEAR(sub_begin_month) = YEAR(original_sub_begin_date)
+  GROUP BY 1,2
+
+  UNION ALL
+
+  -- NEW (paid-adjusted diagonal)
+  SELECT
+    'updated_logic' AS logic,
+    YEAR(paid_cohort_date) AS year,
+    COUNT(DISTINCT account_id) AS platform_new_users
+  FROM android_paid_adjusted
+  WHERE paid_cohort_date IS NOT NULL
+    AND YEAR(sub_begin_month) = YEAR(paid_cohort_date)
+  GROUP BY 1,2
+),
+
+/* =========================
+   Combine + sum across sources
+   ========================= */
+platform_counts_all AS (
+  SELECT * FROM ios_counts
+  UNION ALL SELECT * FROM stripe_counts
+  UNION ALL SELECT * FROM android_counts
+),
+
+platform_totals AS (
+  SELECT
+    year,
+    SUM(CASE WHEN logic = 'tableau_current' THEN platform_new_users ELSE 0 END) AS platform_tableau_current_total,
+    SUM(CASE WHEN logic = 'updated_logic'   THEN platform_new_users ELSE 0 END) AS platform_updated_logic_total
+  FROM platform_counts_all
+  GROUP BY year
+)
+
+SELECT
+  'ALL' AS source,
+  sp.year,
+  sp.sharepoint_new_users_total,
+
+  COALESCE(p.platform_tableau_current_total, 0) AS platform_tableau_current_total,
+  COALESCE(p.platform_updated_logic_total,  0)  AS platform_updated_logic_total,
+
+  COALESCE(p.platform_tableau_current_total, 0) - sp.sharepoint_new_users_total AS delta_tableau_minus_sharepoint,
+  COALESCE(p.platform_updated_logic_total,  0)  - sp.sharepoint_new_users_total AS delta_updated_minus_sharepoint,
+
+  COALESCE(p.platform_updated_logic_total, 0) - COALESCE(p.platform_tableau_current_total, 0) AS delta_updated_minus_tableau,
+
+  ROUND((COALESCE(p.platform_tableau_current_total,0) / NULLIF(sp.sharepoint_new_users_total,0) - 1) * 100, 2) AS pct_delta_tableau,
+  ROUND((COALESCE(p.platform_updated_logic_total,0)  / NULLIF(sp.sharepoint_new_users_total,0) - 1) * 100, 2) AS pct_delta_updated
+
+FROM sp_total sp
+LEFT JOIN platform_totals p
+  ON sp.year = p.year
+ORDER BY sp.year;
