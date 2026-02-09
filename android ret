@@ -1,0 +1,243 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+MIN_YEAR = 2012
+MAX_YEAR = 2026
+YEARS = list(range(MIN_YEAR, MAX_YEAR + 1))
+
+START_DATE = "2012-01-01"
+END_DATE   = "2026-02-04"
+
+sql = f"""
+WITH
+params AS (
+  SELECT
+    DATE '{START_DATE}' AS start_date,
+    DATE '{END_DATE}'   AS end_date
+),
+   --1) Base OP rows (Tableau logic)
+op_base AS (
+  SELECT
+    account_id,
+    subscription_id,
+    CAST(original_sub_begin_date AS DATE) AS original_sub_begin_date,
+    CAST(sub_begin_month AS DATE) AS sub_begin_month
+  FROM op
+  WHERE UPPER(conversion_platform) = 'ANDROID'
+    AND currency_code = 'USD'
+    AND sub_status IN ('active','canceled')
+    AND periodicity IN ('month','year')
+    AND account_id IS NOT NULL
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_begin_month IS NOT NULL
+    AND CAST(sub_begin_month AS DATE)
+        BETWEEN (SELECT start_date FROM params) AND (SELECT end_date FROM params)
+),
+
+-- Tableau current 
+tableau_current AS (
+  SELECT
+    YEAR(original_sub_begin_date) AS cohort_year,
+    YEAR(sub_begin_month)         AS activity_year,
+    COUNT(DISTINCT account_id)    AS users_current_ops
+  FROM op_base
+  GROUP BY 1,2
+),
+
+-- Restrict subscription_events scan to only the subs we care about 
+op_subs AS (
+  SELECT DISTINCT subscription_id
+  FROM op_base
+),
+
+/* ---------------------------
+   2) PaymentState extraction from subscription_events
+      paymentState mapping:
+        0 = Payment Pending
+        1 = Payment Received
+        2 = Free Trial
+        3 = Pending deferred upgrade/downgrade
+   --------------------------- */
+events AS (
+  SELECT
+    se.account_id,
+    se.subscription_id,
+    CAST(COALESCE(se.raw_subscription_timestamp, se.raw_event_timestamp) AS TIMESTAMP) AS evt_ts,
+
+    /* Works whether raw_subscription is VARIANT or JSON-string-like */
+    CAST(
+      COALESCE(
+        se.raw_subscription:paymentState,
+        CAST(get_json_object(CAST(se.raw_subscription AS STRING), '$.paymentState') AS INT)
+      ) AS INT
+    ) AS payment_state
+  FROM unity_catalog.cozi_payments.subscription_events se
+  INNER JOIN op_subs s
+    ON se.subscription_id = s.subscription_id
+  WHERE se.subscription_id IS NOT NULL
+),
+
+events_ranked AS (
+  SELECT
+    account_id,
+    subscription_id,
+    evt_ts,
+    payment_state,
+    ROW_NUMBER() OVER (PARTITION BY subscription_id ORDER BY evt_ts) AS rn
+  FROM events
+  WHERE payment_state IS NOT NULL
+    AND evt_ts IS NOT NULL
+),
+
+sub_payment_flags AS (
+  SELECT
+    subscription_id,
+
+    /* state at earliest observed snapshot */
+    MAX(CASE WHEN rn = 1 THEN payment_state END) AS first_payment_state,
+
+    /* first time we ever see Payment Received */
+    MIN(CASE WHEN payment_state = 1 THEN evt_ts END) AS first_paid_ts,
+
+    /* first time we ever see Free Trial */
+    MIN(CASE WHEN payment_state = 2 THEN evt_ts END)  AS first_trial_ts
+  FROM events_ranked
+  GROUP BY 1
+),
+
+op_enriched AS (
+  SELECT
+    o.*,
+    f.first_payment_state,
+    f.first_paid_ts,
+    f.first_trial_ts,
+
+    CASE WHEN f.first_payment_state = 2 THEN 1 ELSE 0 END AS is_trial_start,
+    CASE WHEN f.first_payment_state = 2 AND f.first_paid_ts IS NULL THEN 1 ELSE 0 END AS is_trial_only,
+
+    CASE
+      WHEN f.first_payment_state = 2 THEN CAST(f.first_paid_ts AS DATE)
+      ELSE o.original_sub_begin_date
+    END AS paid_cohort_date
+
+  FROM op_base o
+  LEFT JOIN sub_payment_flags f
+    ON o.subscription_id = f.subscription_id
+),
+
+paid_adjusted_rows AS (
+  SELECT *
+  FROM op_enriched
+  WHERE is_trial_only = 0
+    AND (
+      is_trial_start = 0
+      OR (
+        paid_cohort_date IS NOT NULL
+        AND sub_begin_month >= TRUNC(paid_cohort_date, 'month')
+      )
+    )
+),
+
+paid_adjusted_counts AS (
+  SELECT
+    YEAR(paid_cohort_date) AS cohort_year,
+    YEAR(sub_begin_month) AS activity_year,
+    COUNT(DISTINCT account_id) AS users_paid_adjusted
+  FROM paid_adjusted_rows
+  GROUP BY 1,2
+)
+
+SELECT
+  COALESCE(t.cohort_year, p.cohort_year) AS cohort_year,
+  COALESCE(t.activity_year, p.activity_year) AS activity_year,
+  COALESCE(t.users_current_ops, 0) AS users_current_ops,
+  COALESCE(p.users_paid_adjusted, 0) AS users_paid_adjusted
+FROM tableau_current t
+FULL OUTER JOIN paid_adjusted_counts p
+  ON t.cohort_year = p.cohort_year
+ AND t.activity_year = p.activity_year
+ORDER BY cohort_year, activity_year
+"""
+
+df = spark.sql(sql).toPandas()
+
+def build_matrix(df_in: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    mat = (
+        df_in.pivot_table(
+            index="cohort_year",
+            columns="activity_year",
+            values=value_col,
+            aggfunc="sum",
+            fill_value=0
+        )
+        .reindex(index=YEARS, columns=YEARS, fill_value=0)
+        .astype(float)
+    )
+
+    r = np.array(mat.index)
+    c = np.array(mat.columns)
+    return mat.where(c[None, :] >= r[:, None], np.nan)
+
+def retention_from_matrix(mat: pd.DataFrame) -> pd.DataFrame:
+    diag = pd.Series(index=mat.index, dtype=float)
+    for y in mat.index:
+        diag[y] = mat.at[y, y] if (y in mat.columns) else np.nan
+    diag = diag.replace({0: np.nan})
+    return mat.div(diag, axis=0)
+
+def fmt_counts(mat: pd.DataFrame) -> pd.DataFrame:
+    def f(x):
+        return "" if pd.isna(x) else f"{int(x):,}"
+    return mat.apply(lambda col: col.map(f))
+
+def fmt_pct(mat: pd.DataFrame, digits: int = 2) -> pd.DataFrame:
+    def f(x):
+        return "" if pd.isna(x) else f"{x*100:.{digits}f}%"
+    return mat.apply(lambda col: col.map(f))
+
+def plot_heatmap(mat: pd.DataFrame, title: str, vmin=None, vmax=None):
+    data = np.ma.masked_invalid(mat.values)
+    fig, ax = plt.subplots(figsize=(14, 6))
+    im = ax.imshow(data, aspect="auto", interpolation="nearest", vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+    ax.set_xticks(np.arange(len(mat.columns)))
+    ax.set_xticklabels(mat.columns, rotation=90)
+    ax.set_yticks(np.arange(len(mat.index)))
+    ax.set_yticklabels(mat.index)
+    plt.colorbar(im, ax=ax)
+    plt.tight_layout()
+    plt.show()
+
+def show(title: str, obj):
+    print(title)
+    try:
+        display(obj)
+    except NameError:
+        print(obj)
+
+df = df.dropna(subset=["cohort_year", "activity_year"]).copy()
+df["cohort_year"] = df["cohort_year"].astype(int)
+df["activity_year"] = df["activity_year"].astype(int)
+df["users_current_ops"] = pd.to_numeric(df["users_current_ops"], errors="coerce").fillna(0).astype(int)
+df["users_paid_adjusted"] = pd.to_numeric(df["users_paid_adjusted"], errors="coerce").fillna(0).astype(int)
+
+mat_tableau = build_matrix(df, "users_current_ops")
+mat_paid    = build_matrix(df, "users_paid_adjusted")
+
+ret_tableau = retention_from_matrix(mat_tableau)
+ret_paid    = retention_from_matrix(mat_paid)
+
+# 1) User-count matrices 
+show("ANDROID | User Count | Tableau Current (users_current_ops)", fmt_counts(mat_tableau))
+show("ANDROID | User Count | Updated Logic", fmt_counts(mat_paid))
+
+# 2) Retention % matrices
+show("ANDROID | Retention % | Tableau Current", fmt_pct(ret_tableau))
+show("ANDROID | Retention % | Updated Logic", fmt_pct(ret_paid))
+
+# 3) Retention heatmaps
+plot_heatmap(ret_tableau, "ANDROID | Retention Heatmap | Tableau Current", vmin=0, vmax=1)
+plot_heatmap(ret_paid,    "ANDROID | Retention Heatmap | Updated Logic", vmin=0, vmax=1)
