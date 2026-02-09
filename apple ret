@@ -1,0 +1,170 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+PLATFORMS = ["IOS"]                
+CURRENCY_CODE = "USD"
+STATUSES = ("active", "canceled")
+PERIODICITIES = ("month", "year")
+
+ONLY_APPLE_PROVIDER = True
+
+
+MIN_YEAR = None
+MAX_YEAR = None
+
+
+platform_list_sql = ", ".join([f"'{p.upper()}'" for p in PLATFORMS])
+status_list_sql = ", ".join([f"'{s}'" for s in STATUSES])
+period_list_sql = ", ".join([f"'{p}'" for p in PERIODICITIES])
+
+provider_filter_sql = ""
+if ONLY_APPLE_PROVIDER:
+    provider_filter_sql = "AND provider_name IS NOT NULL AND LOWER(provider_name) LIKE '%apple%'"
+
+query = f"""
+WITH base AS (
+  SELECT
+    account_id,
+    conversion_platform,
+    currency_code,
+    sub_status,
+    periodicity,
+    sub_iteration,
+    CAST(original_sub_begin_date AS DATE) AS original_sub_begin_date,
+    CAST(sub_begin_month AS DATE) AS sub_begin_month
+  FROM op
+  WHERE UPPER(conversion_platform) IN ({platform_list_sql})
+    AND currency_code = '{CURRENCY_CODE}'
+    AND sub_status IN ({status_list_sql})
+    AND periodicity IN ({period_list_sql})
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_begin_month IS NOT NULL
+    {provider_filter_sql}
+),
+
+base_with_first AS (
+  SELECT
+    b.*,
+    MIN(CASE WHEN b.sub_iteration = 1 THEN b.original_sub_begin_date END)
+      OVER (PARTITION BY b.account_id) AS first_start_date
+  FROM base b
+),
+
+agg AS (
+  -- Original (Tableau) cohort year = year of original_sub_begin_date
+  SELECT
+    'tableau_current' AS cohort_def,
+    UPPER(conversion_platform) AS platform,
+    YEAR(original_sub_begin_date) AS cohort_year,
+    YEAR(sub_begin_month) AS activity_year,
+    COUNT(DISTINCT account_id) AS user_cnt
+  FROM base_with_first
+  GROUP BY 1,2,3,4
+
+  UNION ALL
+
+  -- (Apple-aligned) cohort year = year of first start per account
+  SELECT
+    'updated_logic' AS cohort_def,
+    UPPER(conversion_platform) AS platform,
+    YEAR(first_start_date) AS cohort_year,
+    YEAR(sub_begin_month)  AS activity_year,
+    COUNT(DISTINCT account_id) AS user_cnt
+  FROM base_with_first
+  WHERE first_start_date IS NOT NULL
+  GROUP BY 1,2,3,4
+)
+SELECT *
+FROM agg
+WHERE cohort_year IS NOT NULL AND activity_year IS NOT NULL
+"""
+
+spark_df = spark.sql(query)
+df = spark_df.toPandas()
+
+if MIN_YEAR is None:
+    MIN_YEAR = int(min(df["cohort_year"].min(), df["activity_year"].min()))
+if MAX_YEAR is None:
+    MAX_YEAR = int(max(df["cohort_year"].max(), df["activity_year"].max()))
+
+years = list(range(MIN_YEAR, MAX_YEAR + 1))
+
+def build_matrix(df_sub: pd.DataFrame) -> pd.DataFrame:
+    """Return numeric matrix (float with NaNs below diagonal for readability)."""
+    mat = (
+        df_sub.pivot_table(
+            index="cohort_year",
+            columns="activity_year",
+            values="user_cnt",
+            aggfunc="sum",
+            fill_value=0
+        )
+        .reindex(index=years, columns=years, fill_value=0)
+        .astype(float)
+    )
+
+    # blank out below-diagonal (activity year < cohort year) to match Tableau look
+    row_years = np.array(mat.index)
+    col_years = np.array(mat.columns)
+    mat = mat.where(col_years[None, :] >= row_years[:, None], np.nan)
+    return mat
+
+def retention_from_matrix(mat: pd.DataFrame) -> pd.DataFrame:
+    diag = pd.Series({y: (mat.at[y, y] if (y in mat.index and y in mat.columns) else np.nan) for y in mat.index})
+    ret = mat.div(diag, axis=0)
+    return ret
+
+def display_matrix_as_table(mat: pd.DataFrame, title: str, is_percent: bool=False):
+    if is_percent:
+        tbl = (mat * 100.0).copy()
+        tbl = tbl.applymap(lambda x: "" if pd.isna(x) else f"{x:,.2f}%")
+    else:
+        tbl = mat.copy()
+        tbl = tbl.applymap(lambda x: "" if pd.isna(x) else f"{int(x):,}")
+    print(title)
+    try:
+        display(tbl) 
+    except NameError:
+        print(tbl)
+
+def plot_heatmap(mat: pd.DataFrame, title: str, vmin=None, vmax=None):
+    data = np.ma.masked_invalid(mat.values)
+    fig, ax = plt.subplots(figsize=(14, 6))
+    im = ax.imshow(data, aspect="auto", interpolation="nearest", vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+
+    ax.set_xticks(np.arange(len(mat.columns)))
+    ax.set_xticklabels(mat.columns, rotation=90)
+    ax.set_yticks(np.arange(len(mat.index)))
+    ax.set_yticklabels(mat.index)
+
+    plt.colorbar(im, ax=ax)
+    plt.tight_layout()
+    plt.show()
+
+
+# visuals
+
+cohort_defs = ["tableau_current", "updated_logic"]
+
+for platform in PLATFORMS:
+    platform = platform.upper()
+    for cohort_def in cohort_defs:
+        df_sub = df[(df["platform"] == platform) & (df["cohort_def"] == cohort_def)].copy()
+
+        if df_sub.empty:
+            print(f"No data for platform={platform}, cohort_def={cohort_def}")
+            continue
+
+        user_mat = build_matrix(df_sub)
+        ret_mat  = retention_from_matrix(user_mat)
+
+        # Tables (tableau)
+        display_matrix_as_table(user_mat, f"{platform} | {cohort_def} | User Count")
+        display_matrix_as_table(ret_mat,  f"{platform} | {cohort_def} | Retention Rate", is_percent=True)
+
+        # Heatmaps 
+        #plot_heatmap(user_mat, f"{platform} | {cohort_def} | User Count Heatmap")
+        plot_heatmap(ret_mat,  f"{platform} | {cohort_def} | Retention Rate Heatmap", vmin=0, vmax=1)
