@@ -1,0 +1,78 @@
+%sql
+WITH sp AS (
+  SELECT year, sharepoint_new_users
+  FROM sharepoint_new_users
+  WHERE source = 'IOS'
+),
+base AS (
+  SELECT
+    account_id,
+    subscription_id,
+    sub_iteration,
+    CAST(original_sub_begin_date AS DATE) AS original_sub_begin_date,
+    CAST(sub_begin_month        AS DATE) AS sub_begin_month
+  FROM op
+  WHERE UPPER(conversion_platform) = 'IOS'
+    AND currency_code = 'USD'
+    AND sub_status IN ('active','canceled')
+    AND periodicity IN ('month','year')
+    AND subscription_id IS NOT NULL
+    AND original_sub_begin_date IS NOT NULL
+    AND sub_begin_month IS NOT NULL
+    AND provider_name IS NOT NULL
+    AND LOWER(provider_name) LIKE '%apple%'
+),
+base_with_first AS (
+  SELECT
+    b.*,
+    MIN(CASE WHEN b.sub_iteration = 1 THEN b.original_sub_begin_date END)
+      OVER (PARTITION BY b.account_id) AS first_start_date
+  FROM base b
+),
+counts AS (
+  -- OLD (Tableau-style): cohort year = year(original_sub_begin_date)
+  SELECT
+    'tableau_current' AS logic,
+    YEAR(original_sub_begin_date) AS year,
+    COUNT(DISTINCT account_id) AS platform_new_users
+  FROM base_with_first
+  WHERE YEAR(sub_begin_month) = YEAR(original_sub_begin_date)          -- diagonal
+    AND YEAR(original_sub_begin_date) IN (SELECT year FROM sp)
+  GROUP BY 1,2
+
+  UNION ALL
+
+  -- NEW (Apple-aligned): cohort year = year(first_start_date)
+  SELECT
+    'updated_logic' AS logic,
+    YEAR(first_start_date) AS year,
+    COUNT(DISTINCT account_id) AS platform_new_users
+  FROM base_with_first
+  WHERE first_start_date IS NOT NULL
+    AND YEAR(sub_begin_month) = YEAR(first_start_date)                -- diagonal
+    AND YEAR(first_start_date) IN (SELECT year FROM sp)
+  GROUP BY 1,2
+),
+pivoted AS (
+  SELECT
+    year,
+    MAX(CASE WHEN logic = 'tableau_current' THEN platform_new_users END) AS platform_tableau_current,
+    MAX(CASE WHEN logic = 'updated_logic'   THEN platform_new_users END) AS platform_updated_logic
+  FROM counts
+  GROUP BY 1
+)
+SELECT
+  'IOS' AS source,
+  sp.year,
+  sp.sharepoint_new_users,
+  COALESCE(p.platform_tableau_current, 0) AS platform_tableau_current,
+  COALESCE(p.platform_updated_logic,   0) AS platform_updated_logic,
+  COALESCE(p.platform_tableau_current, 0) - sp.sharepoint_new_users AS delta_tableau_minus_sharepoint,
+  COALESCE(p.platform_updated_logic,   0) - sp.sharepoint_new_users AS delta_updated_minus_sharepoint,
+  COALESCE(p.platform_updated_logic, 0) - COALESCE(p.platform_tableau_current, 0) AS delta_updated_minus_tableau,
+  ROUND((COALESCE(p.platform_tableau_current,0) / NULLIF(sp.sharepoint_new_users,0) - 1) * 100, 2) AS pct_delta_tableau,
+  ROUND((COALESCE(p.platform_updated_logic,0)   / NULLIF(sp.sharepoint_new_users,0) - 1) * 100, 2) AS pct_delta_updated
+FROM sp
+LEFT JOIN pivoted p
+  ON sp.year = p.year
+ORDER BY sp.year;
