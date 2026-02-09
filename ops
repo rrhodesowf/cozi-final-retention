@@ -1,0 +1,213 @@
+%sql
+create or replace temp view op as (
+  WITH accts1 as (
+    SELECT
+      a.account_id
+      , CASE WHEN CONTAINS(LOWER(a.account_state),'delete') THEN 'canceled' ELSE 'active' END AS account_state
+      , a.region_designator as region_code
+      , a.creation_date as acct_creation_date 
+      , c.description as acct_signup_source
+    FROM unity_catalog.cozi_vault.accounts a
+    LEFT JOIN unity_catalog.cozi_vault.account_source_info b ON a.account_id = b.account_id
+    LEFT JOIN unity_catalog.cozi_metavault.api_users c ON b.signup_source = c.api_user_id
+ )
+, acct_region_lookup AS (
+    SELECT DISTINCT account_id, b.abbrev2 as country_code FROM (
+      SELECT account_id, country_code, 1 as source_rank FROM unity_catalog.cozi_payments.subscription_events 
+      UNION ALL
+      SELECT account_id, country_code, 2 as source_rank FROM unity_catalog.cozi_payments.subscription_events_history
+      UNION ALL
+      SELECT user_id as account_id, RIGHT(context_locale,2) as country_code, 3 as source_rank FROM cozi_segment.cozi_android_production.identifies WHERE user_id IS NOT NULL AND UPPER(TRIM(RIGHT(context_locale,2))) <> 'EN'
+      UNION ALL
+      SELECT user_id as account_id, RIGHT(context_locale,2) as country_code, 3 as source_rank FROM cozi_segment.cozi_ios_server_production.identifies WHERE user_id IS NOT NULL AND UPPER(TRIM(RIGHT(context_locale,2))) <> 'EN'
+      UNION ALL
+      SELECT user_id as account_id, RIGHT(context_locale,2) as country_code, 3 as source_rank FROM cozi_segment.cozi_web_production.identifies WHERE user_id IS NOT NULL AND UPPER(TRIM(RIGHT(context_locale,2))) <> 'EN'
+    ) a
+    LEFT JOIN unity_catalog.admin.country_abbreviations b ON UPPER(TRIM(a.country_code)) = b.abbrev2 OR UPPER(TRIM(a.country_code)) = b.abbrev3
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY source_rank) = 1
+)
+, acct_delete_requests AS (
+    SELECT 
+      account_id
+      , MIN(record_start_ts) AS acct_delete_request_date 
+    FROM unity_catalog.cozi_vault.accounts_history 
+    WHERE account_state = 'PendingDelete'
+    GROUP BY ALL
+)
+, acct_deletions AS (
+    SELECT 
+      account_id
+      , MIN(record_start_ts) AS acct_delete_date 
+    FROM unity_catalog.cozi_vault.accounts_history 
+    WHERE account_state = 'Deleted'
+    GROUP BY ALL
+)
+, accts2 AS (
+    SELECT 
+      a.account_id
+      , a.account_state
+      , COALESCE(a.region_code,b.country_code) AS region_code
+      , a.acct_signup_source
+      , a.acct_creation_date
+      , COALESCE(c.acct_delete_request_date,d.acct_delete_date) as acct_delete_request_date
+      , d.acct_delete_date
+    FROM accts1 a
+    LEFT JOIN acct_region_lookup b ON a.account_id = b.account_id
+    LEFT JOIN acct_delete_requests c ON a.account_id = c.account_id
+    LEFT JOIN acct_deletions d ON a.account_id = d.account_id
+)
+ , acct_subs AS (
+    SELECT
+        vps.account_id
+        , accts.account_state
+        , accts.region_code
+        , accts.acct_signup_source
+        , accts.acct_creation_date
+        , accts.acct_delete_request_date
+        , accts.acct_delete_date
+        , vps.subscription_id
+        , vps.status AS sub_status
+        , b.product_name
+        , d.name AS provider_name
+        , CASE WHEN CONTAINS(LOWER(a.subscribing_app),'coziwc') THEN 'WEB'
+            WHEN CONTAINS(LOWER(a.subscribing_app),'droid') THEN 'ANDROID'
+            WHEN CONTAINS(LOWER(a.subscribing_app),'ipad') 
+                OR CONTAINS(LOWER(a.subscribing_app),'iphone') 
+                OR CONTAINS(LOWER(a.subscribing_app),'ipod') THEN 'IOS'
+            WHEN CONTAINS(LOWER(a.subscribing_app),'coziapicli')
+                OR CONTAINS(LOWER(a.subscribing_app),'cozi cli') THEN 'COZI CLI'
+             WHEN CONTAINS(LOWER(a.subscribing_app),'toolbox') THEN 'TOOLBOX'
+            ELSE UPPER(a.subscribing_app) END AS conversion_platform
+        , a.subscription_start
+        , case when (accts.acct_delete_date < a.subscription_end or (accts.acct_delete_date is not null and a.subscription_end is null)) then accts.acct_delete_date else 
+          case when a.subscription_end is null and vps.status = 'canceled' and c.periodicity = 'month'
+                  then dateadd(month,1,a.subscription_start)
+                when a.subscription_end is null and vps.status = 'canceled'
+                  then dateadd(year,1,a.subscription_start)
+                when a.subscription_end is null and vps.status = 'active' and c.periodicity = 'month' 
+                  then 
+                      case when current_date < dateadd(month,(month(current_date) - month(a.subscription_start)),dateadd(year,year(current_date) - year(a.subscription_start), a.subscription_start))
+                              then dateadd(month,(month(current_date) - month(a.subscription_start)),dateadd(year,year(current_date) - year(a.subscription_start), a.subscription_start))
+                          else dateadd(month,(month(current_date) - month(a.subscription_start))+1,dateadd(year,year(current_date) - year(a.subscription_start), a.subscription_start)) end
+                when a.subscription_end is null and vps.status = 'active'
+                  then 
+                      case when current_date < dateadd(year,year(current_date) - year(a.subscription_start), a.subscription_start) and year(current_date) <> year(a.subscription_start)
+                              then dateadd(year,year(current_date) - year(a.subscription_start), a.subscription_start)
+                          else dateadd(year,(year(current_date) - year(a.subscription_start))+1, a.subscription_start) end
+                else a.subscription_end end end AS subscription_end
+        , c.amount AS subscription_amount
+        , c.periodicity
+        , c.currency_code
+    FROM cozi_vault.premium_subscriptions vps
+    LEFT JOIN cozi_payments.premium_subscription_details a ON vps.account_id = a.account_id AND vps.subscription_id = a.subscription_id
+    LEFT JOIN cozi_payments.premium_products b ON a.premium_product_id = b.product_id
+    LEFT JOIN cozi_payments.premium_payment_levels c ON b.payment_level_id = c.payment_level_id
+    LEFT JOIN cozi_payments.paid_subscription_providers d ON b.provider_id = d.provider_id
+    LEFT JOIN accts2 accts ON vps.account_id = accts.account_id
+)
+, dates as (
+    Select 
+        trunc(cal_date, 'month') as cal_month
+    from oracle_fw_object.dates 
+    where cal_date between date '2011-01-01' and dateadd(year,1,trunc(current_date,'year')-1)
+    group by all
+) 
+, ext_subs as (
+    select 
+        a.*,
+        case when a.periodicity <> 'month' and month(a.subscription_start) = month(b.cal_month)
+                then b.cal_month
+            when a.periodicity <> 'month' and month(a.subscription_start) <> month(b.cal_month)
+                then null
+            else b.cal_month end as sub_begin_month
+    from acct_subs a
+    cross join dates b
+    where b.cal_month between trunc(a.subscription_start,'month') and add_months(trunc(a.subscription_end,'month'),-1)
+    and case when a.periodicity <> 'month' and month(a.subscription_start) = month(b.cal_month)
+                then b.cal_month
+            when a.periodicity <> 'month' and month(a.subscription_start) <> month(b.cal_month)
+                then null
+            else b.cal_month end is not null
+    group by all
+)
+, free_paid_union as (
+select
+    * EXCEPT(subscription_start, subscription_end)
+    , subscription_start as original_sub_begin_date
+    , subscription_end as final_end_date
+    , DATE(case when trunc(subscription_end,'month') < date(case when periodicity = 'month' then add_months(sub_begin_month, 1) else dateadd(year,1,sub_begin_month) end)
+            then trunc(subscription_end,'month')
+           else date(case when periodicity = 'month' then add_months(sub_begin_month, 1) else dateadd(year,1,sub_begin_month) end) end) as sub_end_month
+    , row_number() over(partition by account_id order by subscription_start, sub_begin_month) as account_iteration
+    , row_number() over(partition by account_id, subscription_id order by sub_begin_month) as sub_iteration
+from ext_subs
+UNION ALL
+select 
+    account_id
+    , account_state
+    , region_code
+    , acct_signup_source
+    , acct_creation_date
+    , acct_delete_request_date
+    , acct_delete_date
+    , NULL AS subscription_id
+    , NULL AS sub_status
+    , NULL AS product_name
+    , NULL AS provider_name
+    , NULL AS conversion_platform
+    , NULL AS subscription_amount
+    , NULL AS periodicity
+    , NULL AS currency_code
+    , NULL AS sub_begin_month
+    , NULL AS original_sub_begin_date
+    , NULL AS final_end_date
+    , NULL AS sub_end_month
+    , NULL AS account_iteration
+    , NULL AS sub_iteration
+from accts2
+where account_id not in (select account_id from acct_subs where account_id is not null)
+)
+, seg_signup_source AS (
+    SELECT
+        account_id
+        , account_person_email as email
+        , account_person_id
+        , timestamp as account_creation_date
+        , signup_source
+    FROM cozi_segment.cozi_server_production.account_creation
+    QUALIFY ROW_NUMBER() OVER(PARTITION BY account_id ORDER BY timestamp ASC) = 1
+)
+Select
+    a.account_id
+    , acct_creation_date
+    , case when contains(lower(coalesce(a.acct_signup_source,b.signup_source)),'ios') then 'IOS'
+        when contains(lower(coalesce(a.acct_signup_source,b.signup_source)),'android')
+        or contains(lower(coalesce(a.acct_signup_source,b.signup_source)),'blackberry') then 'ANDROID'
+        when contains(lower(coalesce(a.acct_signup_source,b.signup_source)),'web')
+        or contains(lower(coalesce(a.acct_signup_source,b.signup_source)),'www.')
+        or contains(lower(coalesce(a.acct_signup_source,b.signup_source)),'pc ') then 'WEB'
+        else UPPER(coalesce(a.acct_signup_source,b.signup_source)) end as acct_signup_source
+    , account_state as acct_status
+    , acct_delete_request_date
+    , acct_delete_date
+    , region_code
+    , subscription_id
+    , sub_status
+    , product_name
+    , periodicity
+    , provider_name
+    , conversion_platform
+    , subscription_amount
+    , currency_code
+    , original_sub_begin_date
+    , final_end_date
+    , sub_begin_month
+    , sub_end_month
+    , account_iteration
+    , sub_iteration
+from free_paid_union a
+left join seg_signup_source b on a.account_id = b.account_id
+where (UPPER(a.acct_signup_source) not in (UPPER('Cozi Development API User'), UPPER('Cozi - Direct2Gold (Test)'), UPPER('Auth0-dev'), UPPER('Cozi - Facebook.Test')) or a.acct_signup_source is null)
+and (a.conversion_platform not in ('COZIDEV','APITEST') or a.conversion_platform is null)
+group by all
+)
